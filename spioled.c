@@ -67,10 +67,10 @@ static DECLARE_BITMAP(minors, N_SPI_MINORS);
 
 
 struct spi_oled {
-	dev_t			devt;
-	spinlock_t		spi_lock;
+	dev_t				devt;
+	spinlock_t			spi_lock;
 	struct spi_device	*spi;
-	struct gpio_desc *dc_gpio;
+	struct gpio_desc 	*dc_gpio;
 	struct list_head	device_entry;
 
 	/* TX/RX buffers are NULL unless this device is open (users > 0) */
@@ -89,6 +89,26 @@ module_param(bufsiz, uint, S_IRUGO);
 MODULE_PARM_DESC(bufsiz, "data bytes in biggest supported SPI message");
 
 /*-------------------------------------------------------------------------*/
+const uint8_t init_instrs[] = {
+	0xae, 0xd5, 0x50, 0xa8, 
+	0x3f, 0xd3, 0x00, 0x40,
+	0x8d, 0x14, 0x20, 0x00, 
+	0xa1, 0xc0, 0xda, 0x12,
+	0x81, 0xef, 0xd9, 0xf1,
+	0xdb, 0x30, 0xa4, 0xa6,
+	0xaf
+};
+
+const uint8_t display_on[] = {
+	0x8d, 0x14, 0xaf,
+};
+
+const uint8_t display_off[] = {
+	0x8d, 0x10, 0xae,
+};
+
+#define DP_SET_PAGE(n) (0xb0+n)
+
 
 static ssize_t
 spidev_sync(struct spi_oled *oled, struct spi_message *message)
@@ -141,6 +161,18 @@ spidev_sync_read(struct spi_oled *oled, size_t len)
 	return spidev_sync(oled, &m);
 }
 
+
+
+int spi_oled_init(struct spi_oled *oled)
+{
+	gpiod_set_value(oled->dc_gpio, 1);
+	memcpy(oled->tx_buffer, init_instrs, sizeof(init_instrs));
+	spidev_sync_write(oled, sizeof(init_instrs));
+	memcpy(oled->tx_buffer, display_on, sizeof(display_on));
+	spidev_sync_write(oled, sizeof(display_on));	
+	return 0;
+}
+
 /*-------------------------------------------------------------------------*/
 
 /* Read-only message with current device setup */
@@ -187,7 +219,15 @@ spidev_write(struct file *filp, const char __user *buf,
 
 	oled = filp->private_data;
 
+
+
 	mutex_lock(&oled->buf_lock);
+	
+	gpiod_set_value(oled->dc_gpio, 1);
+	oled->tx_buffer[0] = DP_SET_PAGE(0);
+	spidev_sync_write(oled, 1);
+
+	gpiod_set_value(oled->dc_gpio, 0);
 	missing = copy_from_user(oled->tx_buffer, buf, count);
 	if (missing == 0)
 		status = spidev_sync_write(oled, count);
@@ -784,6 +824,7 @@ static int spidev_probe(struct spi_device *spi)
 
 	if (status == 0)
 		spi_set_drvdata(spi, oled);
+		spi_oled_init(oled);
 	else
 		kfree(oled);
 
