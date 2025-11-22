@@ -81,6 +81,12 @@ struct spi_oled {
 	u32			speed_hz;
 };
 
+struct spi_cmd_data {
+	uint8_t cmd;
+	uint8_t datalen;
+	uint8_t *datas;
+};
+
 static LIST_HEAD(device_list);
 static DEFINE_MUTEX(device_list_lock);
 
@@ -89,6 +95,7 @@ module_param(bufsiz, uint, S_IRUGO);
 MODULE_PARM_DESC(bufsiz, "data bytes in biggest supported SPI message");
 
 /*-------------------------------------------------------------------------*/
+#if 0
 const uint8_t init_instrs[] = {
 	0xae, 0xd5, 0x50, 0xa8, 
 	0x3f, 0xd3, 0x00, 0x40,
@@ -106,6 +113,33 @@ const uint8_t display_on[] = {
 const uint8_t display_off[] = {
 	0x8d, 0x10, 0xae,
 };
+
+#else
+const uint8_t init_instrs[] = {
+	//************* Start Initial Sequence **********//
+	0x11, 
+	0xff, 0xff, 120		//delay 120ms
+	0x36, 0x01, 0x00,
+	0x3a, 0x01, 0x05,
+	0xb2, 0x05, 0x0C, 0x0C, 0x00, 0x33, 0x33,
+	0xb7, 0x01, 0x35,
+	0xbb, 0x01, 0x37,
+	0xc0, 0x01, 0x2C,
+	0xc2, 0x01, 0x01,
+	0xc3, 0x01, 0x12,
+	0xc4, 0x01, 0x20,
+	0xc6, 0x01, 0x0F,
+	0xd0, 0x02, 0xA4, 0xA1,
+	0xe0, 0x0E, 0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B,
+	          0x3F, 0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F,
+	          0x23,
+	0xe1, 0x0E, 0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C,
+	          0x3F, 0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20,
+	          0x23,
+	0x21, 0x00,
+	0x29, 0x00,	
+};
+#endif
 
 #define DP_SET_PAGE(n) (0xb0+n)
 
@@ -164,12 +198,61 @@ spidev_sync_read(struct spi_oled *oled, size_t len)
 
 
 int spi_oled_init(struct spi_oled *oled)
+{	
+	struct spi_cmd_data cdata;;
+	for (uint8_t *ptr = struct spi_cmd_data;ptr<init_instrs+sizeof(init_instrs);) {
+		if (ptr[0] == 0xff && ptr[1] == 0xff) {
+			msleep(ptr[2]);
+			ptr += 2;
+		} else {
+			cdata.cmd = *ptr++;
+			cdata.datalen = *ptr++;
+			cdata.datas = ptr;
+			ptr += cdata.datalen;
+			gpiod_set_value(oled->dc_gpio, 1);
+			oled->tx_buffer[0] = cdata.cmd;
+			spidev_sync_write(oled, 1);
+			gpiod_set_value(oled->dc_gpio, 0);
+			if (cdata.datalen > 0) {
+				memcpy(oled->tx_buffer, cdata.datas, cdata.datalen);
+				spidev_sync_write(oled, cdata.datalen);
+			}
+		}
+	}
+	return 0;
+}
+
+int spi_oled_addr_reset(struct spi_oled *oled)
 {
+	uint8_t cmd0[] = {0x2a};
+	uint8_t cmd1[] = {0x2b};
+	uint8_t cmd2[] = {0x2c};
+	uint8_t origin[4] = {0x00};
+	
+	//0x2a
 	gpiod_set_value(oled->dc_gpio, 1);
-	memcpy(oled->tx_buffer, init_instrs, sizeof(init_instrs));
-	spidev_sync_write(oled, sizeof(init_instrs));
-	memcpy(oled->tx_buffer, display_on, sizeof(display_on));
-	spidev_sync_write(oled, sizeof(display_on));	
+	oled->tx_buffer[0] = cmd0[0];
+	spidev_sync_write(oled, 1);
+	gpiod_set_value(oled->dc_gpio, 0);
+
+	memcpy(oled->tx_buffer, origin, 4);
+	spidev_sync_write(oled, 4);
+
+	//0x2b
+	gpiod_set_value(oled->dc_gpio, 1);
+	oled->tx_buffer[0] = cmd1[0];
+	spidev_sync_write(oled, 1);
+	gpiod_set_value(oled->dc_gpio, 0);
+
+	memcpy(oled->tx_buffer, origin, 4);
+	spidev_sync_write(oled, 4);
+
+	//0x2c
+	gpiod_set_value(oled->dc_gpio, 1);
+	oled->tx_buffer[0] = cmd2[0];
+	spidev_sync_write(oled, 1);
+	gpiod_set_value(oled->dc_gpio, 0);
+
 	return 0;
 }
 
@@ -222,12 +305,9 @@ spidev_write(struct file *filp, const char __user *buf,
 
 
 	mutex_lock(&oled->buf_lock);
-	
-	gpiod_set_value(oled->dc_gpio, 1);
-	oled->tx_buffer[0] = DP_SET_PAGE(0);
-	spidev_sync_write(oled, 1);
 
-	gpiod_set_value(oled->dc_gpio, 0);
+	spi_oled_addr_reset(oled);
+
 	missing = copy_from_user(oled->tx_buffer, buf, count);
 	if (missing == 0)
 		status = spidev_sync_write(oled, count);
@@ -904,7 +984,7 @@ static void __exit spi_oled_exit(void)
 	class_destroy(spidev_class);
 	unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
 }
-module_exit(spidev_exit);
+module_exit(spi_oled_exit);
 
 MODULE_AUTHOR("Champion Xu, <>");
 MODULE_DESCRIPTION("User mode SPI device interface / but oled");
