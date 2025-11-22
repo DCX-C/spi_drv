@@ -196,8 +196,7 @@ spidev_sync_read(struct spi_oled *oled, size_t len)
 }
 
 
-
-int spi_oled_init(struct spi_oled *oled)
+int spi_oled_hwinit(struct spi_oled *oled)
 {	
 	struct spi_cmd_data cdata;;
 	for (uint8_t *ptr = struct spi_cmd_data;ptr<init_instrs+sizeof(init_instrs);) {
@@ -524,6 +523,13 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (retval == 0) {
 			struct spi_controller *ctlr = spi->controller;
 			u32	save = spi->mode;
+			
+			if (tmp == 0x1306) {
+				dev_dbg(&spi->dev, "oled hwinit\n");
+				spi_oled_hwinit(oled);
+				ret_val = 0;
+				break;
+			}
 
 			if (tmp & ~SPI_MODE_MASK) {
 				retval = -EINVAL;
@@ -852,8 +858,8 @@ static int spidev_probe(struct spi_device *spi)
 	 * rather than a description of the hardware.
 	 */
 	WARN(spi->dev.of_node &&
-	     of_device_is_compatible(spi->dev.of_node, "spidev"),
-	     "%pOF: buggy DT: spidev listed directly in DT\n", spi->dev.of_node);
+	     of_device_is_compatible(spi->dev.of_node, "spi_oled"),
+	     "%pOF: buggy DT: spi_oled listed directly in DT\n", spi->dev.of_node);
 
 	spidev_probe_acpi(spi);
 
@@ -904,7 +910,6 @@ static int spidev_probe(struct spi_device *spi)
 
 	if (status == 0)
 		spi_set_drvdata(spi, oled);
-		spi_oled_init(oled);
 	else
 		kfree(oled);
 
