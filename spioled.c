@@ -27,7 +27,8 @@
 
 #include <linux/uaccess.h>
 #include <linux/gpio/consumer.h>
-
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
 
 /*
  * This supports access to SPI devices using normal userspace I/O calls.
@@ -71,6 +72,7 @@ struct spi_oled {
 	spinlock_t			spi_lock;
 	struct spi_device	*spi;
 	struct gpio_desc 	*dc_gpio;
+	struct gpio_desc 	*rst_gpio;
 	struct list_head	device_entry;
 
 	/* TX/RX buffers are NULL unless this device is open (users > 0) */
@@ -78,6 +80,8 @@ struct spi_oled {
 	unsigned		users;
 	u8			*tx_buffer;
 	u8			*rx_buffer;
+	u8          *dma_buf;
+	dma_addr_t       dma_tx_phys;    // 物理地址
 	u32			speed_hz;
 };
 
@@ -117,8 +121,8 @@ const uint8_t display_off[] = {
 #else
 const uint8_t init_instrs[] = {
 	//************* Start Initial Sequence **********//
-	0x11, 
-	0xff, 0xff, 120		//delay 120ms
+	0x11, 0x00, 
+	0xff, 0xff, 120,		//delay 120ms
 	0x36, 0x01, 0x00,
 	0x3a, 0x01, 0x05,
 	0xb2, 0x05, 0x0C, 0x0C, 0x00, 0x33, 0x33,
@@ -198,23 +202,31 @@ spidev_sync_read(struct spi_oled *oled, size_t len)
 
 int spi_oled_hwinit(struct spi_oled *oled)
 {	
+	uint8_t *ptr;
 	struct spi_cmd_data cdata;;
-	for (uint8_t *ptr = struct spi_cmd_data;ptr<init_instrs+sizeof(init_instrs);) {
+	gpiod_set_value(oled->rst_gpio, 0);
+	msleep(100);
+	gpiod_set_value(oled->rst_gpio, 1);
+	msleep(100);
+
+	for (ptr = init_instrs;ptr<init_instrs+sizeof(init_instrs);) {
 		if (ptr[0] == 0xff && ptr[1] == 0xff) {
 			msleep(ptr[2]);
-			ptr += 2;
+			ptr += 3;
 		} else {
 			cdata.cmd = *ptr++;
 			cdata.datalen = *ptr++;
 			cdata.datas = ptr;
 			ptr += cdata.datalen;
-			gpiod_set_value(oled->dc_gpio, 1);
+			gpiod_set_value(oled->dc_gpio, 0);
 			oled->tx_buffer[0] = cdata.cmd;
 			spidev_sync_write(oled, 1);
-			gpiod_set_value(oled->dc_gpio, 0);
+			gpiod_set_value(oled->dc_gpio, 1);
 			if (cdata.datalen > 0) {
 				memcpy(oled->tx_buffer, cdata.datas, cdata.datalen);
-				spidev_sync_write(oled, cdata.datalen);
+				if (spidev_sync_write(oled, cdata.datalen) == -1) {
+					break;
+				}
 			}
 		}
 	}
@@ -226,31 +238,31 @@ int spi_oled_addr_reset(struct spi_oled *oled)
 	uint8_t cmd0[] = {0x2a};
 	uint8_t cmd1[] = {0x2b};
 	uint8_t cmd2[] = {0x2c};
-	uint8_t origin[4] = {0x00};
+	uint8_t origin[4] = {0, 0, 0, 240};
 	
 	//0x2a
-	gpiod_set_value(oled->dc_gpio, 1);
+	gpiod_set_value(oled->dc_gpio, 0);
 	oled->tx_buffer[0] = cmd0[0];
 	spidev_sync_write(oled, 1);
-	gpiod_set_value(oled->dc_gpio, 0);
+	gpiod_set_value(oled->dc_gpio, 1);
 
 	memcpy(oled->tx_buffer, origin, 4);
 	spidev_sync_write(oled, 4);
 
 	//0x2b
-	gpiod_set_value(oled->dc_gpio, 1);
+	gpiod_set_value(oled->dc_gpio, 0);
 	oled->tx_buffer[0] = cmd1[0];
 	spidev_sync_write(oled, 1);
-	gpiod_set_value(oled->dc_gpio, 0);
+	gpiod_set_value(oled->dc_gpio, 1);
 
 	memcpy(oled->tx_buffer, origin, 4);
 	spidev_sync_write(oled, 4);
 
 	//0x2c
-	gpiod_set_value(oled->dc_gpio, 1);
+	gpiod_set_value(oled->dc_gpio, 0);
 	oled->tx_buffer[0] = cmd2[0];
 	spidev_sync_write(oled, 1);
-	gpiod_set_value(oled->dc_gpio, 0);
+	gpiod_set_value(oled->dc_gpio, 1);
 
 	return 0;
 }
@@ -315,6 +327,23 @@ spidev_write(struct file *filp, const char __user *buf,
 	mutex_unlock(&oled->buf_lock);
 
 	return status;
+}
+
+static int spidev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    struct spi_oled	*oled = filp->private_data;
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long pfn;
+
+    // 禁用缓存（对 MMIO/DMA 区域很重要）
+    vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+    pfn = __phys_to_pfn(oled->dma_tx_phys);
+    if (remap_pfn_range(vma, vma->vm_start, pfn,
+                        size, vma->vm_page_prot))
+        return -EAGAIN;
+
+    return 0;
 }
 
 static int spidev_message(struct spi_oled *oled,
@@ -462,6 +491,7 @@ spidev_get_ioc_message(unsigned int cmd, struct spi_ioc_transfer __user *u_ioc,
 static long
 spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+#define SPI_IOC_WR_MMAP		_IO(SPI_IOC_MAGIC, 6)
 	int			retval = 0;
 	struct spi_oled	*oled;
 	struct spi_device	*spi;
@@ -527,7 +557,7 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			if (tmp == 0x1306) {
 				dev_dbg(&spi->dev, "oled hwinit\n");
 				spi_oled_hwinit(oled);
-				ret_val = 0;
+				retval = 0;
 				break;
 			}
 
@@ -593,6 +623,18 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			spi->max_speed_hz = save;
 		}
 		break;
+	case SPI_IOC_WR_MMAP:
+		spi_oled_addr_reset(oled);
+		struct spi_transfer	t = {
+			.tx_buf		= oled->dma_buf,
+			.len		= 240*240*2,
+			.speed_hz	= oled->speed_hz,
+		};
+		struct spi_message	m;
+
+		spi_message_init(&m);
+		spi_message_add_tail(&t, &m);
+		retval = spidev_sync(oled, &m);
 
 	default:
 		/* segmented and/or full-duplex I/O request */
@@ -721,6 +763,19 @@ static int spidev_open(struct inode *inode, struct file *filp)
 		}
 	}
 
+
+	if (!oled->dma_buf) {
+		oled->dma_buf = dma_alloc_coherent(&oled->spi->dev,
+                                            1<<17,
+                                            &oled->dma_tx_phys,
+                                            GFP_KERNEL);
+		if (!oled->dma_buf) {
+        	dev_dbg(&oled->spi->dev, "open/dma alloc fail\n");
+			status = -ENOMEM;
+			goto err_alloc_dma_buf;
+		}
+	}
+
 	oled->users++;
 	filp->private_data = oled;
 	stream_open(inode, filp);
@@ -728,6 +783,9 @@ static int spidev_open(struct inode *inode, struct file *filp)
 	mutex_unlock(&device_list_lock);
 	return 0;
 
+err_alloc_dma_buf:
+	kfree(oled->rx_buffer);
+	oled->rx_buffer = NULL;
 err_alloc_rx_buf:
 	kfree(oled->tx_buffer);
 	oled->tx_buffer = NULL;
@@ -735,6 +793,7 @@ err_find_dev:
 	mutex_unlock(&device_list_lock);
 	return status;
 }
+
 
 static int spidev_release(struct inode *inode, struct file *filp)
 {
@@ -787,6 +846,7 @@ static const struct file_operations spidev_fops = {
 	.open =		spidev_open,
 	.release =	spidev_release,
 	.llseek =	no_llseek,
+	.mmap = spidev_mmap,
 };
 
 /*-------------------------------------------------------------------------*/
@@ -850,7 +910,6 @@ static int spidev_probe(struct spi_device *spi)
 	struct spi_oled	*oled;
 	int			status;
 	unsigned long		minor;
-	struct gpio_desc *dc_gpio;
 
 	/*
 	 * spidev should never be referenced in DT without a specific
@@ -862,19 +921,24 @@ static int spidev_probe(struct spi_device *spi)
 	     "%pOF: buggy DT: spi_oled listed directly in DT\n", spi->dev.of_node);
 
 	spidev_probe_acpi(spi);
-
-	
-
-	dc_gpio = devm_gpiod_get(&spi->dev, "dc", GPIOD_OUT_LOW);
-	if (IS_ERR(dc_gpio)) {
-    	dev_err(&spi->dev, "Failed to get reset GPIO\n");
-    	return PTR_ERR(dc_gpio);
-	}
 	
 	/* Allocate driver data */
 	oled = kzalloc(sizeof(*oled), GFP_KERNEL);
 	if (!oled)
 		return -ENOMEM;
+
+	oled->dc_gpio = devm_gpiod_get(&spi->dev, "dc", GPIOD_OUT_LOW);
+	if (IS_ERR(oled->dc_gpio)) {
+    	dev_err(&spi->dev, "Failed to get dc GPIO\n");
+    	return PTR_ERR(oled->dc_gpio);
+	}
+
+	oled->rst_gpio = devm_gpiod_get(&spi->dev, "rst", GPIOD_OUT_LOW);
+	if (IS_ERR(oled->rst_gpio)) {
+    	dev_err(&spi->dev, "Failed to get reset GPIO\n");
+    	return PTR_ERR(oled->rst_gpio);
+	}
+
 
 	/* Initialize the driver data */
 	oled->spi = spi;
@@ -904,6 +968,12 @@ static int spidev_probe(struct spi_device *spi)
 		set_bit(minor, minors);
 		list_add(&oled->device_entry, &device_list);
 	}
+
+	if (dma_set_coherent_mask(&spi->dev, DMA_BIT_MASK(32)) != 0) {
+    	dev_err(&spi->dev, "Failed to set coherent mask\n");
+    	return -ENODEV;
+	}
+
 	mutex_unlock(&device_list_lock);
 
 	oled->speed_hz = spi->max_speed_hz;
